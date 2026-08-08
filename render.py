@@ -1,6 +1,5 @@
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import JSONResponse, FileResponse
-import subprocess
 import os
 import base64
 import uuid
@@ -19,53 +18,86 @@ FILE_STORE: Dict[str, str] = {}
 
 @app.get("/healthz")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "service": "File Host for Creatomate"}
 
 
-@app.post("/upload")
-async def upload_file(data: dict):
-    """Upload base64 file, return public URL"""
-    file_id = str(uuid.uuid4())[:12]
-    work_dir = f"/tmp/uploads/{file_id}"
-    os.makedirs(work_dir, exist_ok=True)
+@app.post("/upload-scenes")
+async def upload_scenes(data: dict):
+    """
+    Upload all scene images and audio at once.
+    Returns public URLs that Creatomate can access.
+    """
+    batch_id = str(uuid.uuid4())[:8]
 
     try:
-        file_base64 = data.get("file_base64")
-        file_extension = data.get("extension", "bin")
+        scenes = data.get("scenes", [])
+        base_url = data.get("base_url", "")
 
-        if not file_base64:
-            return JSONResponse(status_code=400, content={"error": "No file_base64"})
+        if not scenes:
+            return JSONResponse(status_code=400, content={"error": "No scenes provided"})
 
-        file_path = f"{work_dir}/file.{file_extension}"
-        with open(file_path, "wb") as f:
-            f.write(base64.b64decode(file_base64))
+        if not base_url:
+            return JSONResponse(status_code=400, content={"error": "base_url required"})
 
-        FILE_STORE[file_id] = file_path
+        results = []
 
-        file_size_kb = round(os.path.getsize(file_path) / 1024, 1)
-        logger.info(f"Uploaded {file_id}: {file_size_kb} KB")
+        for i, scene in enumerate(scenes):
+            # Save image
+            img_id = f"{batch_id}_img_{i}"
+            img_dir = f"/tmp/uploads/{img_id}"
+            os.makedirs(img_dir, exist_ok=True)
+            img_path = f"{img_dir}/file.png"
+
+            with open(img_path, "wb") as f:
+                f.write(base64.b64decode(scene["image_base64"]))
+
+            FILE_STORE[img_id] = img_path
+
+            # Save audio
+            aud_id = f"{batch_id}_aud_{i}"
+            aud_dir = f"/tmp/uploads/{aud_id}"
+            os.makedirs(aud_dir, exist_ok=True)
+            aud_path = f"{aud_dir}/file.mp3"
+
+            with open(aud_path, "wb") as f:
+                f.write(base64.b64decode(scene["audio_base64"]))
+
+            FILE_STORE[aud_id] = aud_path
+
+            results.append({
+                "scene_number": i + 1,
+                "image_url": f"{base_url}/file/{img_id}.png",
+                "audio_url": f"{base_url}/file/{aud_id}.mp3"
+            })
+
+            # Free memory
+            scene["image_base64"] = None
+            scene["audio_base64"] = None
+            gc.collect()
+
+        logger.info(f"Batch {batch_id}: uploaded {len(scenes)} scenes")
 
         return {
-            "file_id": file_id,
-            "url": f"/file/{file_id}.{file_extension}",
-            "size_kb": file_size_kb
+            "batch_id": batch_id,
+            "scenes": results,
+            "expires_in_minutes": 30
         }
 
     except Exception as e:
-        shutil.rmtree(work_dir, ignore_errors=True)
+        logger.error(f"Upload error: {str(e)}")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 @app.get("/file/{filename}")
 async def get_file(filename: str):
-    """Serve uploaded file"""
-    file_id = filename.split('.')[0]
+    """Serve uploaded file to Creatomate"""
+    file_id = filename.rsplit('.', 1)[0]
     file_path = FILE_STORE.get(file_id)
 
     if not file_path or not os.path.exists(file_path):
         return JSONResponse(status_code=404, content={"error": "File not found"})
 
-    extension = filename.split('.')[-1].lower()
+    extension = filename.rsplit('.', 1)[-1].lower() if '.' in filename else 'bin'
     mime_types = {
         'png': 'image/png',
         'jpg': 'image/jpeg',
@@ -79,11 +111,17 @@ async def get_file(filename: str):
     return FileResponse(file_path, media_type=media_type)
 
 
-@app.delete("/file/{file_id}")
-async def delete_file(file_id: str):
-    """Cleanup file"""
-    file_path = FILE_STORE.pop(file_id, None)
-    if file_path:
-        work_dir = os.path.dirname(file_path)
-        shutil.rmtree(work_dir, ignore_errors=True)
-    return {"deleted": True}
+@app.post("/cleanup/{batch_id}")
+async def cleanup_batch(batch_id: str):
+    """Delete all files for a batch after video is rendered"""
+    deleted = 0
+    keys_to_remove = [k for k in FILE_STORE.keys() if k.startswith(batch_id)]
+
+    for key in keys_to_remove:
+        file_path = FILE_STORE.pop(key, None)
+        if file_path:
+            work_dir = os.path.dirname(file_path)
+            shutil.rmtree(work_dir, ignore_errors=True)
+            deleted += 1
+
+    return {"deleted": deleted, "batch_id": batch_id}
