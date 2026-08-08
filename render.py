@@ -1,5 +1,5 @@
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, BackgroundTasks
+from fastapi.responses import JSONResponse, FileResponse
 import subprocess
 import os
 import base64
@@ -7,11 +7,15 @@ import uuid
 import shutil
 import logging
 import gc
+from typing import Dict
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+# Store rendered video paths temporarily
+VIDEO_STORE: Dict[str, str] = {}
 
 
 @app.get("/healthz")
@@ -46,31 +50,26 @@ async def render_video(data: dict):
             )
 
         logger.info(f"Job {job_id}: {len(scenes)} scenes at {width}x{height}")
+        num_scenes = len(scenes)
 
-        # Save files ONE AT A TIME and immediately free memory
+        # Save files ONE AT A TIME
         for i, scene in enumerate(scenes):
-            # Decode and save image
             img_data = base64.b64decode(scene["image_base64"])
             with open(f"{work_dir}/img_{i}.png", "wb") as f:
                 f.write(img_data)
-            del img_data  # free memory
+            del img_data
+            scene["image_base64"] = None
 
-            # Decode and save audio
             audio_data = base64.b64decode(scene["audio_base64"])
             with open(f"{work_dir}/aud_{i}.mp3", "wb") as f:
                 f.write(audio_data)
             del audio_data
-
-            # Clear base64 strings from scene dict
-            scene["image_base64"] = None
             scene["audio_base64"] = None
 
-        # Clear input scenes from memory
+        # Clear input
         scenes = None
         data = None
         gc.collect()
-
-        num_scenes = len([f for f in os.listdir(work_dir) if f.startswith("img_")])
 
         # Get audio durations
         durations = []
@@ -89,7 +88,7 @@ async def render_video(data: dict):
 
         logger.info(f"Job {job_id}: durations {durations}")
 
-        # Encode segments one at a time
+        # Encode segments
         for i in range(num_scenes):
             segment_path = f"{work_dir}/seg_{i}.mp4"
             cmd = [
@@ -111,25 +110,24 @@ async def render_video(data: dict):
                 segment_path
             ]
 
-            logger.info(f"Job {job_id}: encoding scene {i + 1}/{num_scenes}")
+            logger.info(f"Job {job_id}: encoding {i + 1}/{num_scenes}")
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
 
             if result.returncode != 0:
-                logger.error(f"FFmpeg error scene {i}: {result.stderr}")
+                logger.error(f"FFmpeg scene {i}: {result.stderr}")
                 return JSONResponse(
                     status_code=500,
-                    content={
-                        "error": f"FFmpeg failed on scene {i + 1}",
-                        "details": result.stderr[-300:]
-                    }
+                    content={"error": f"FFmpeg failed scene {i + 1}"}
                 )
 
-            # Delete source files after encoding to save disk
+            # Delete source files immediately
             try:
                 os.remove(f"{work_dir}/img_{i}.png")
                 os.remove(f"{work_dir}/aud_{i}.mp3")
             except:
                 pass
+
+            gc.collect()
 
         # Concat file
         concat_path = f"{work_dir}/concat.txt"
@@ -137,7 +135,7 @@ async def render_video(data: dict):
             for i in range(num_scenes):
                 f.write(f"file 'seg_{i}.mp4'\n")
 
-        # Concatenate (fast - no re-encoding)
+        # Concatenate
         output_path = f"{work_dir}/final.mp4"
         cmd = [
             "ffmpeg", "-y",
@@ -153,49 +151,63 @@ async def render_video(data: dict):
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
 
         if result.returncode != 0:
-            logger.error(f"Concat error: {result.stderr}")
             return JSONResponse(
                 status_code=500,
-                content={"error": "Concat failed", "details": result.stderr[-300:]}
+                content={"error": "Concat failed"}
             )
 
-        # Delete segment files after concat
+        # Delete segments
         for i in range(num_scenes):
             try:
                 os.remove(f"{work_dir}/seg_{i}.mp4")
             except:
                 pass
 
-        # Read video file
-        with open(output_path, "rb") as f:
-            video_data = f.read()
+        file_size_kb = round(os.path.getsize(output_path) / 1024, 1)
+        logger.info(f"Job {job_id}: done, {file_size_kb} KB")
 
-        file_size_kb = round(len(video_data) / 1024, 1)
-        logger.info(f"Job {job_id}: video size {file_size_kb} KB")
+        # Store path for later download
+        VIDEO_STORE[job_id] = output_path
 
-        # Encode to base64
-        video_base64 = base64.b64encode(video_data).decode()
-        del video_data
-        gc.collect()
-
+        # Return download URL instead of base64
         return {
-            "video_base64": video_base64,
+            "job_id": job_id,
+            "download_url": f"/download/{job_id}",
             "file_size_kb": file_size_kb,
             "scenes_count": num_scenes
         }
 
-    except subprocess.TimeoutExpired as e:
-        logger.error(f"Job {job_id}: timeout")
-        return JSONResponse(
-            status_code=500,
-            content={"error": "Rendering timeout"}
-        )
     except Exception as e:
-        logger.error(f"Job {job_id}: error {str(e)}")
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)}
-        )
-    finally:
         shutil.rmtree(work_dir, ignore_errors=True)
-        gc.collect()
+        logger.error(f"Job {job_id}: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/download/{job_id}")
+async def download_video(job_id: str, background_tasks: BackgroundTasks):
+    video_path = VIDEO_STORE.get(job_id)
+
+    if not video_path or not os.path.exists(video_path):
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Video not found or expired"}
+        )
+
+    # Clean up after download
+    work_dir = os.path.dirname(video_path)
+    
+    def cleanup():
+        try:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            VIDEO_STORE.pop(job_id, None)
+            logger.info(f"Cleaned up {job_id}")
+        except:
+            pass
+
+    background_tasks.add_task(cleanup)
+
+    return FileResponse(
+        video_path,
+        media_type="video/mp4",
+        filename="video.mp4"
+    )
