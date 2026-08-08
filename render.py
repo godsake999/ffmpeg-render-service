@@ -15,7 +15,6 @@ app = FastAPI()
 
 @app.get("/healthz")
 def health():
-    # Verify FFmpeg is available
     try:
         result = subprocess.run(
             ["ffmpeg", "-version"],
@@ -45,64 +44,80 @@ async def render_video(data: dict):
                 content={"error": "No scenes provided"}
             )
 
-        logger.info(f"Job {job_id}: Rendering {len(scenes)} scenes")
-        concat_list = []
+        logger.info(f"Job {job_id}: Rendering {len(scenes)} scenes at {width}x{height}")
 
+        # Save all files first
         for i, scene in enumerate(scenes):
-            logger.info(f"Job {job_id}: Processing scene {i + 1}")
-
-            # Save image
             img_data = base64.b64decode(scene["image_base64"])
-            img_path = f"{work_dir}/scene_{i}.png"
-            with open(img_path, "wb") as f:
+            with open(f"{work_dir}/img_{i}.png", "wb") as f:
                 f.write(img_data)
 
-            # Save audio
             audio_data = base64.b64decode(scene["audio_base64"])
-            audio_path = f"{work_dir}/scene_{i}.mp3"
-            with open(audio_path, "wb") as f:
+            with open(f"{work_dir}/aud_{i}.mp3", "wb") as f:
                 f.write(audio_data)
 
-            # Create video segment
-            segment_path = f"{work_dir}/segment_{i}.mp4"
+        # Get duration of each audio for proper image duration
+        durations = []
+        for i in range(len(scenes)):
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", 
+                 "format=duration", "-of", "default=noprint_wrappers=1:nokey=1",
+                 f"{work_dir}/aud_{i}.mp3"],
+                capture_output=True, text=True
+            )
+            try:
+                duration = float(result.stdout.strip())
+            except:
+                duration = 5.0
+            durations.append(duration)
+
+        logger.info(f"Job {job_id}: Audio durations: {durations}")
+
+        # Create segments with fast preset
+        for i in range(len(scenes)):
+            segment_path = f"{work_dir}/seg_{i}.mp4"
             cmd = [
                 "ffmpeg", "-y",
+                "-loglevel", "error",
                 "-loop", "1",
-                "-i", img_path,
-                "-i", audio_path,
+                "-i", f"{work_dir}/img_{i}.png",
+                "-i", f"{work_dir}/aud_{i}.mp3",
                 "-c:v", "libx264",
+                "-preset", "ultrafast",   # FASTEST encoding
                 "-tune", "stillimage",
                 "-c:a", "aac",
-                "-b:a", "128k",
+                "-b:a", "96k",
                 "-pix_fmt", "yuv420p",
                 "-r", str(fps),
-                "-shortest",
+                "-t", str(durations[i]),
                 "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black",
                 segment_path
             ]
 
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            logger.info(f"Job {job_id}: Encoding scene {i + 1}/{len(scenes)}")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            
             if result.returncode != 0:
                 logger.error(f"FFmpeg error scene {i}: {result.stderr}")
                 return JSONResponse(
                     status_code=500,
                     content={
-                        "error": f"FFmpeg failed on scene {i}",
+                        "error": f"FFmpeg failed on scene {i + 1}",
                         "details": result.stderr[-500:]
                     }
                 )
 
-            concat_list.append(f"file 'segment_{i}.mp4'")
-
-        # Write concat file
+        # Concat file
         concat_path = f"{work_dir}/concat.txt"
         with open(concat_path, "w") as f:
-            f.write("\n".join(concat_list))
+            for i in range(len(scenes)):
+                f.write(f"file 'seg_{i}.mp4'\n")
 
-        # Concatenate all segments
+        # Concatenate all segments (fast, no re-encoding)
         output_path = f"{work_dir}/final.mp4"
         cmd = [
             "ffmpeg", "-y",
+            "-loglevel", "error",
             "-f", "concat",
             "-safe", "0",
             "-i", concat_path,
@@ -110,7 +125,9 @@ async def render_video(data: dict):
             output_path
         ]
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        logger.info(f"Job {job_id}: Concatenating {len(scenes)} segments")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        
         if result.returncode != 0:
             logger.error(f"Concat error: {result.stderr}")
             return JSONResponse(
@@ -123,25 +140,30 @@ async def render_video(data: dict):
 
         # Read final video
         with open(output_path, "rb") as f:
-            video_base64 = base64.b64encode(f.read()).decode()
+            video_data = f.read()
 
-        file_size = os.path.getsize(output_path)
-        logger.info(
-            f"Job {job_id}: Done. Size: {file_size / 1024:.1f} KB"
-        )
+        video_base64 = base64.b64encode(video_data).decode()
+        file_size_kb = round(len(video_data) / 1024, 1)
+
+        logger.info(f"Job {job_id}: Done. {file_size_kb} KB")
 
         return {
             "video_base64": video_base64,
-            "file_size_kb": round(file_size / 1024, 1),
+            "file_size_kb": file_size_kb,
             "scenes_count": len(scenes)
         }
 
+    except subprocess.TimeoutExpired as e:
+        logger.error(f"Job {job_id}: Timeout - {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Rendering timeout: {str(e)}"}
+        )
     except Exception as e:
-        logger.error(f"Job {job_id}: Error: {str(e)}")
+        logger.error(f"Job {job_id}: Error - {str(e)}")
         return JSONResponse(
             status_code=500,
             content={"error": str(e)}
         )
-
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
