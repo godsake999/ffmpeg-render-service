@@ -23,10 +23,6 @@ def health():
 
 @app.post("/upload-scenes")
 async def upload_scenes(data: dict):
-    """
-    Upload all scene images and audio at once.
-    Returns public URLs that Creatomate can access.
-    """
     batch_id = str(uuid.uuid4())[:8]
 
     try:
@@ -42,14 +38,28 @@ async def upload_scenes(data: dict):
         results = []
 
         for i, scene in enumerate(scenes):
-            # Save image
             img_id = f"{batch_id}_img_{i}"
             img_dir = f"/tmp/uploads/{img_id}"
             os.makedirs(img_dir, exist_ok=True)
-            img_path = f"{img_dir}/file.png"
 
+            # Decode image and detect format from magic bytes
+            img_bytes = base64.b64decode(scene["image_base64"])
+            
+            # Detect image type from first bytes
+            if img_bytes[:3] == b'\xff\xd8\xff':
+                ext = 'jpg'
+            elif img_bytes[:8] == b'\x89PNG\r\n\x1a\n':
+                ext = 'png'
+            elif img_bytes[:6] in (b'GIF87a', b'GIF89a'):
+                ext = 'gif'
+            elif img_bytes[:4] == b'RIFF' and img_bytes[8:12] == b'WEBP':
+                ext = 'webp'
+            else:
+                ext = 'jpg'  # default fallback
+
+            img_path = f"{img_dir}/file.{ext}"
             with open(img_path, "wb") as f:
-                f.write(base64.b64decode(scene["image_base64"]))
+                f.write(img_bytes)
 
             FILE_STORE[img_id] = img_path
 
@@ -66,11 +76,10 @@ async def upload_scenes(data: dict):
 
             results.append({
                 "scene_number": i + 1,
-                "image_url": f"{base_url}/file/{img_id}.png",
+                "image_url": f"{base_url}/file/{img_id}.{ext}",
                 "audio_url": f"{base_url}/file/{aud_id}.mp3"
             })
 
-            # Free memory
             scene["image_base64"] = None
             scene["audio_base64"] = None
             gc.collect()
